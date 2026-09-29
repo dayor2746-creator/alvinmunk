@@ -15,6 +15,7 @@ import {
   type ClaimCode,
   type VouchView,
 } from '@/lib/reputation';
+import { reverseHandle } from '@/lib/registry';
 import { Crest } from '@/components/brand/crest';
 import { Frame } from '@/components/fx/frame';
 import { Stamp } from '@/components/fx/stamp';
@@ -76,6 +77,8 @@ function ClaimInner({ params }: { params: { id: string } }) {
   // so a slow/failing RPC never masquerades as an expired or missing vouch.
   const [loadError, setLoadError] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
+  /** @handle of the voucher (null = none or lookup still in flight). Never blocks the claim. */
+  const [voucherHandle, setVoucherHandle] = useState<string | null>(null);
 
   useEffect(() => setClaimCode(readClaimCode()), []);
 
@@ -101,6 +104,19 @@ function ClaimInner({ params }: { params: { id: string } }) {
   }, [vid, validId, reloadKey]);
 
   const loading = validId && vouch === undefined && !loadError;
+
+  // Fire-and-forget reverse handle lookup — never blocks the claim button.
+  // Runs once the vouch is loaded and we have the voucher's address.
+  useEffect(() => {
+    if (!vouch?.from) return;
+    let alive = true;
+    reverseHandle(vouch.from).then((h) => {
+      if (alive) setVoucherHandle(h);
+    }).catch(() => {
+      // Lookup failure is silent: the page falls back to shortAddr automatically.
+    });
+    return () => { alive = false; };
+  }, [vouch?.from]);
 
   const nowSec = Math.floor(Date.now() / 1000);
   const deadline = vouch ? vouch.created + VOUCH_TTL_SECS : 0;
@@ -205,7 +221,11 @@ function ClaimInner({ params }: { params: { id: string } }) {
         {done ? '// connected' : '// incoming_vouch'}
       </p>
       <h1 className="mt-4 font-display text-4xl font-semibold tracking-tight">
-        {done ? "You're connected." : 'Someone vouched for you.'}
+        {done
+          ? "You're connected."
+          : voucherHandle
+            ? t('claim.voucher.headlineHandle', { handle: voucherHandle })
+            : t('claim.voucher.headlineFallback')}
       </h1>
       <p className="mt-3 max-w-sm text-muted-foreground text-balance">
         {done
@@ -219,8 +239,18 @@ function ClaimInner({ params }: { params: { id: string } }) {
           <div className="flex flex-col items-center gap-2 text-center">
             <Crest address={vouch?.from ?? `voucher-${id}`} size={88} points={6} animate />
             <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
-              {vouch ? shortAddr(vouch.from) : 'from'}
+              {voucherHandle ? `@${voucherHandle}` : vouch ? shortAddr(vouch.from) : 'from'}
             </span>
+            {voucherHandle && vouch && !done && (
+              <Link
+                href={`/u/${voucherHandle}`}
+                target="_blank"
+                rel="noreferrer"
+                className="font-mono text-[9px] uppercase tracking-wider text-primary/70 underline underline-offset-2 hover:text-primary transition-colors"
+              >
+                {t('claim.voucher.viewProfile', { handle: voucherHandle })}
+              </Link>
+            )}
           </div>
           <ArrowRight className={cn('size-5', done ? 'text-primary' : 'text-muted-foreground')} />
           <div className="flex flex-col items-center gap-2 text-center">
