@@ -15,7 +15,9 @@ import {
   type ClaimCode,
   type VouchView,
 } from '@/lib/reputation';
-import { reverseHandle } from '@/lib/registry';
+import { getMeta, reverseHandle } from '@/lib/registry';
+import { Avatar } from '@/components/Avatar';
+import type { AvatarConfig } from '@/lib/avatar';
 import { Crest } from '@/components/brand/crest';
 import { Frame } from '@/components/fx/frame';
 import { Stamp } from '@/components/fx/stamp';
@@ -79,6 +81,8 @@ function ClaimInner({ params }: { params: { id: string } }) {
   const [reloadKey, setReloadKey] = useState(0);
   /** @handle of the voucher (null = none or lookup still in flight). Never blocks the claim. */
   const [voucherHandle, setVoucherHandle] = useState<string | null>(null);
+  /** The voucher's published face (undefined = none / still loading → deterministic default). */
+  const [voucherAvatar, setVoucherAvatar] = useState<AvatarConfig | undefined>(undefined);
 
   useEffect(() => setClaimCode(readClaimCode()), []);
 
@@ -105,17 +109,22 @@ function ClaimInner({ params }: { params: { id: string } }) {
 
   const loading = validId && vouch === undefined && !loadError;
 
-  // Fire-and-forget reverse handle lookup — never blocks the claim button.
-  // Runs once the vouch is loaded and we have the voucher's address.
+  // Who vouched (#218): the voucher's @handle and face, looked up after the vouch loads and
+  // fire-and-forget — a slow or failing read only keeps the address fallback; it never
+  // blocks or delays the Claim button.
   useEffect(() => {
-    if (!vouch?.from) return;
+    const from = vouch?.from;
+    if (!from) return;
     let alive = true;
-    reverseHandle(vouch.from).then((h) => {
-      if (alive) setVoucherHandle(h);
-    }).catch(() => {
-      // Lookup failure is silent: the page falls back to shortAddr automatically.
-    });
-    return () => { alive = false; };
+    reverseHandle(from)
+      .then((h) => alive && setVoucherHandle(h))
+      .catch(() => {});
+    getMeta(from)
+      .then((meta) => alive && setVoucherAvatar(meta?.avatar))
+      .catch(() => {});
+    return () => {
+      alive = false;
+    };
   }, [vouch?.from]);
 
   const nowSec = Math.floor(Date.now() / 1000);
@@ -237,7 +246,11 @@ function ClaimInner({ params }: { params: { id: string } }) {
         {/* the two halves */}
         <div className="grid grid-cols-[1fr_auto_1fr] items-center gap-2 p-6">
           <div className="flex flex-col items-center gap-2 text-center">
-            <Crest address={vouch?.from ?? `voucher-${id}`} size={88} points={6} animate />
+            {vouch ? (
+              <Avatar address={vouch.from} avatar={voucherAvatar} handle={voucherHandle ?? undefined} size={88} />
+            ) : (
+              <Crest address={`voucher-${id}`} size={88} points={6} animate />
+            )}
             <span className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">
               {voucherHandle ? `@${voucherHandle}` : vouch ? shortAddr(vouch.from) : 'from'}
             </span>
