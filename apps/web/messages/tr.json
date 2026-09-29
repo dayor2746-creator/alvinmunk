@@ -126,6 +126,9 @@
   "claim.skip": "Şimdilik atla → profilini oluştur",
   "claim.openApp": "uygulamayı_aç →",
   "claim.viewProfile": "profilini_görüntüle →",
+  "claim.voucher.headlineHandle": "@{handle} seni destekledi.",
+  "claim.voucher.headlineFallback": "Biri seni destekledi.",
+  "claim.voucher.viewProfile": "@{handle} profilini görüntüle →",
 
   "appHome.whatNow": "Ne yapılacak",
   "appHome.recentActivity": "Son aktivite",

@@ -126,6 +126,9 @@
   "claim.skip": "Skip for now → create your profile",
   "claim.openApp": "open_the_app →",
   "claim.viewProfile": "view_your_profile →",
+  "claim.voucher.headlineHandle": "@{handle} vouched for you.",
+  "claim.voucher.headlineFallback": "Someone vouched for you.",
+  "claim.voucher.viewProfile": "view @{handle}'s profile →",
 
   "appHome.whatNow": "What now",
   "appHome.recentActivity": "Recent activity",
