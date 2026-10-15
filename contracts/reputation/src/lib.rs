@@ -50,6 +50,13 @@ const BONUS_VOUCHER: u64 = 5; // voucher's 2nd-order bonus, released once the cl
 const VOUCH_TTL_SECS: u64 = 604_800; // 7 days — claim within this window to refund the stake
 const MAX_PENDING: u32 = 64; // cap on pending 2nd-order bonuses per claimer (bounds the flush loop)
 
+// Most half-cards one `mint_vouches` call mints. Each card writes its `Vouch` and
+// `ClaimPubkey` entries and emits two events, so a full batch stays far inside the
+// per-transaction limits (testnet and mainnet, checked 2026-09-29: 200 written entries,
+// 132,096 write bytes, 16,384 event bytes). Mirrored by `VOUCH_BATCH_MAX` in
+// apps/web/src/lib/reputation.ts.
+const MAX_BATCH_VOUCH: u32 = 10;
+
 // Domain tag, first element of every signed claim message (see `claim_message`). It keeps a
 // claim signature from ever doubling as a valid signature over another protocol's message.
 const CLAIM_DOMAIN: &str = "alvinmunk_vouch_claim";
@@ -73,6 +80,13 @@ pub enum Error {
     /// The card needs the other claim entrypoint: `claim_vouch_signed` for a card minted
     /// with a claim key, `claim_vouch` for one minted with a claim hash.
     WrongClaimMethod = 13,
+    /// `mint_vouches` got a different number of claim keys and notes.
+    LengthMismatch = 14,
+    /// `mint_vouches` got no cards, or more than `MAX_BATCH_VOUCH`.
+    BadBatchSize = 15,
+    /// The voucher cancelled the half-card (`cancel_vouch`): it can no longer be claimed,
+    /// or cancelled again.
+    Cancelled = 16,
 }
 
 #[contracttype]
@@ -92,7 +106,8 @@ pub enum DataKey {
     Pending(Address),          // claimer -> Vec<PendingBonus> (2nd-order voucher bonuses owed)
     VouchedBy(Address),        // u32 — distinct people who vouched for this address
     Backed(Address),           // u32 — distinct people this address vouched for
-    ClaimPubkey(u64),          // vouch id -> ed25519 claim key (cards from mint_vouch_signed)
+    ClaimPubkey(u64),          // vouch id -> ed25519 claim key (mint_vouch_signed / mint_vouches)
+    Cancelled(u64),            // vouch id -> true once its voucher cancelled it (cancel_vouch)
 }
 
 /// Async half-card vouch. `mint_vouch_signed` binds it to an ed25519 claim key (stored
@@ -162,10 +177,11 @@ pub struct ReputationContract;
 
 #[contractimpl]
 impl ReputationContract {
-    pub fn init(env: Env, admin: Address) {
-        if env.storage().instance().has(&DataKey::Admin) {
-            panic_with_error!(&env, Error::AlreadyInitialized);
-        }
+    /// Deploy-time setup (#127): `stellar contract deploy … -- --admin <ADDR>` runs this inside
+    /// the deploy transaction, so nobody can claim the admin between deploy and setup —
+    /// there is no `init` to front-run. `upgrade` never runs a constructor: a contract
+    /// deployed before this change was set up by its old `init` and keeps that state.
+    pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
     }
 
@@ -211,22 +227,43 @@ impl ReputationContract {
     /// other address. Escrows `VOUCH_STAKE` Social XP from `from` (refunded on a timely
     /// claim, else slashed). New wallets get `STARTER_SOCIAL` first so the first vouch is
     /// free. Each voucher may mint `MAX_VOUCH_PER_DAY` per UTC calendar day
-    /// (`timestamp / DAY_SECS`, counting both mint entrypoints), else `DailyCapReached`. The
+    /// (`timestamp / DAY_SECS`, counting every mint entrypoint), else `DailyCapReached`. The
     /// count resets at 00:00:00 UTC, not 24 hours after the first mint, so a full day's mints
     /// at 23:59:59 and another full day's a second later are both allowed. `note` is at most
     /// `MAX_NOTE_BYTES` bytes of UTF-8, else `NoteTooLong`: it is stored in the vouch, which
     /// every claim rewrites. Returns the id.
     pub fn mint_vouch_signed(env: Env, from: Address, claim_key: BytesN<32>, note: String) -> u64 {
         from.require_auth();
-        // No hash secret: all zeros has no known sha256 preimage, and `claim_vouch` refuses
-        // a keyed card before it even compares hashes.
-        let id = Self::mint(&env, &from, BytesN::from_array(&env, &[0; 32]), note);
-        let key = DataKey::ClaimPubkey(id);
-        env.storage().persistent().set(&key, &claim_key);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
-        id
+        Self::mint_keyed(&env, &from, claim_key, note)
+    }
+
+    /// Batch `mint_vouch_signed` for a cohort leader: `from` signs once and mints one
+    /// half-card per `(claim_keys[i], notes[i])`, in order, returning the ids in the same
+    /// order. Every card goes through exactly the path a separate `mint_vouch_signed` call
+    /// takes — note cap, per-day cap, starter XP, one `VOUCH_STAKE` escrow, its stored
+    /// `Vouch` and `ClaimPubkey`, and its own `social` debit and `("vouch","minted")` events —
+    /// so indexers and the feed cannot tell a batch from N single mints. The two vectors
+    /// must be the same length, else `LengthMismatch`, and hold 1..=`MAX_BATCH_VOUCH` cards,
+    /// else `BadBatchSize`. Any card that fails (`NoteTooLong`, `DailyCapReached`,
+    /// `InsufficientStake`) reverts the whole batch: nothing is minted or escrowed.
+    pub fn mint_vouches(
+        env: Env,
+        from: Address,
+        claim_keys: Vec<BytesN<32>>,
+        notes: Vec<String>,
+    ) -> Vec<u64> {
+        from.require_auth();
+        if claim_keys.len() != notes.len() {
+            panic_with_error!(&env, Error::LengthMismatch);
+        }
+        if claim_keys.is_empty() || claim_keys.len() > MAX_BATCH_VOUCH {
+            panic_with_error!(&env, Error::BadBatchSize);
+        }
+        let mut ids = Vec::new(&env);
+        for (claim_key, note) in claim_keys.iter().zip(notes.iter()) {
+            ids.push_back(Self::mint_keyed(&env, &from, claim_key, note));
+        }
+        ids
     }
 
     /// LEGACY: `from` mints a half-card bound to `claim_hash` (= sha256 of a secret held in
@@ -310,6 +347,42 @@ impl ReputationContract {
         );
     }
 
+    /// `from` cancels an unclaimed half-card whose share link leaked, so nobody can claim
+    /// it. Only the card's voucher may cancel (`NotAuthorized`), only while it is unclaimed
+    /// (`AlreadyClaimed`) and only once (`Cancelled`). It works before and after the claim
+    /// window, since a late claim would still land. The cancellation is its own entry,
+    /// `DataKey::Cancelled(vouch_id)`, because the stored `Vouch` shape is frozen; the card
+    /// itself is not rewritten (read `is_cancelled`). There is NO stake refund: the stake is
+    /// what makes an unclaimed vouch cost something, and a refunding cancel would make
+    /// spray-vouching free again, so cancelling is a voluntary slash. Both claim entrypoints
+    /// then revert with `Cancelled`. Emits `vouch`/`cancelled` (vouch_id, from).
+    pub fn cancel_vouch(env: Env, from: Address, vouch_id: u64) {
+        from.require_auth();
+        let vouch: Vouch = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Vouch(vouch_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::VouchNotFound));
+        if vouch.from != from {
+            panic_with_error!(&env, Error::NotAuthorized);
+        }
+        if vouch.claimed {
+            panic_with_error!(&env, Error::AlreadyClaimed);
+        }
+        let key = DataKey::Cancelled(vouch_id);
+        if env.storage().persistent().has(&key) {
+            panic_with_error!(&env, Error::Cancelled);
+        }
+        env.storage().persistent().set(&key, &true);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+        env.events().publish(
+            (symbol_short!("vouch"), symbol_short!("cancelled")),
+            (vouch_id, from),
+        );
+    }
+
     // --- Attester-issued XP (verifiable quests) ---
 
     /// Allowlisted attester (or the QuestRegistry contract) credits the EARNED
@@ -375,6 +448,14 @@ impl ReputationContract {
             .get(&DataKey::ClaimPubkey(vouch_id))
     }
 
+    /// True once the voucher cancelled half-card `vouch_id` (`cancel_vouch`); false for a
+    /// live, claimed or unknown card. A cancelled card can no longer be claimed.
+    pub fn is_cancelled(env: Env, vouch_id: u64) -> bool {
+        env.storage()
+            .persistent()
+            .has(&DataKey::Cancelled(vouch_id))
+    }
+
     /// True once `addr` has performed a verified (Earned) action — this is the gate
     /// that releases pending 2nd-order voucher bonuses.
     pub fn is_verified(env: Env, addr: Address) -> bool {
@@ -422,7 +503,22 @@ impl ReputationContract {
 
     // --- internal ---
 
-    /// Shared body of both mints: note cap, per-day cap, starter XP, stake escrow, then the
+    /// One claim-key card, as `mint_vouch_signed` and each card of `mint_vouches` mint it:
+    /// the shared `mint`, then the key it claims with. Callers have already checked `from`'s
+    /// auth.
+    fn mint_keyed(env: &Env, from: &Address, claim_key: BytesN<32>, note: String) -> u64 {
+        // No hash secret: all zeros has no known sha256 preimage, and `claim_vouch` refuses
+        // a keyed card before it even compares hashes.
+        let id = Self::mint(env, from, BytesN::from_array(env, &[0; 32]), note);
+        let key = DataKey::ClaimPubkey(id);
+        env.storage().persistent().set(&key, &claim_key);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_EXTEND);
+        id
+    }
+
+    /// Shared body of every mint: note cap, per-day cap, starter XP, stake escrow, then the
     /// stored half-card and its `minted` event. Callers have already checked `from`'s auth.
     fn mint(env: &Env, from: &Address, claim_hash: BytesN<32>, note: String) -> u64 {
         if note.len() > MAX_NOTE_BYTES {
@@ -488,13 +584,21 @@ impl ReputationContract {
         id
     }
 
-    /// The half-card `vouch_id`, reverting unless it exists and is still unclaimed.
+    /// The half-card `vouch_id`, reverting unless it exists, is still unclaimed and was not
+    /// cancelled by its voucher.
     fn unclaimed_vouch(env: &Env, vouch_id: u64) -> Vouch {
         let vouch: Vouch = env
             .storage()
             .persistent()
             .get(&DataKey::Vouch(vouch_id))
             .unwrap_or_else(|| panic_with_error!(env, Error::VouchNotFound));
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Cancelled(vouch_id))
+        {
+            panic_with_error!(env, Error::Cancelled);
+        }
         if vouch.claimed {
             panic_with_error!(env, Error::AlreadyClaimed);
         }
@@ -516,8 +620,9 @@ impl ReputationContract {
     }
 
     /// Shared tail of both claim paths, once the claim is authenticated: binds `claimer`,
-    /// refunds a timely stake, pays first-pair Social XP (the voucher's bonus now or queued)
-    /// and moves the people counters, then emits `claimed`.
+    /// refunds a timely stake (or sets slashed=true and emits `vouch`/`slashed` for a late
+    /// claim), pays first-pair Social XP (the voucher's bonus now or queued) and moves the
+    /// people counters, then emits `claimed`.
     fn settle_claim(env: &Env, vouch_id: u64, mut vouch: Vouch, claimer: Address) {
         if claimer == vouch.from {
             panic_with_error!(env, Error::SelfVouch);
@@ -526,16 +631,31 @@ impl ReputationContract {
         // Starter Social XP for the claimer (once), before crediting claim XP.
         Self::grant_starter(env, &claimer);
 
+        // Evaluate the deadline BEFORE persisting so the stored record is consistent.
+        let now = env.ledger().timestamp();
+        let timely = !vouch.slashed && now <= claim_deadline(&vouch);
+        // A late claim slashes here, unless `expire_vouch` already did (and announced it).
+        let slash_now = !timely && !vouch.slashed;
+        if slash_now {
+            vouch.slashed = true;
+        }
+
         vouch.claimed = true;
         vouch.claimer = Some(claimer.clone());
         env.storage()
             .persistent()
             .set(&DataKey::Vouch(vouch_id), &vouch);
 
-        // Refund the voucher's stake on a timely claim (else it stays slashed).
-        let now = env.ledger().timestamp();
-        if !vouch.slashed && now <= claim_deadline(&vouch) {
+        if timely {
+            // Timely claim: refund the escrowed stake.
             Self::add_social(env, &vouch.from, vouch.stake);
+        } else if slash_now {
+            // Late claim: emit vouch/slashed (same event as expire_vouch) BEFORE
+            // vouch/claimed so both slash paths leave identical state and events.
+            env.events().publish(
+                (symbol_short!("vouch"), symbol_short!("slashed")),
+                (vouch_id, vouch.from.clone(), vouch.stake),
+            );
         }
 
         // first-pair-only guard (kills back-and-forth pump)

@@ -10,16 +10,20 @@ import { useLocale, useTranslations } from '@/lib/i18n';
 import type { FaceId } from '@/lib/avatar';
 import type { Wallet } from '@/lib/wallet';
 
-/** Where a create-profile flow runs from. Drives both the `onboard.<from>.*` i18n keys
- *  and the `from` field on the `profile_created` track event. */
+/** Where a create-profile flow runs from. Drives the `from` field on analytics events, and
+ *  whether the claim page's own `onboard.claim.*` messages are used (see `messageKey`). */
 export type CreateProfileSource = 'app' | 'landing' | 'claim';
 
-/** `reserved`: freed recently and cooling down for its previous owner (see `reservedUntil`). */
-export type HandleAvailability = 'idle' | 'checking' | 'free' | 'taken' | 'reserved';
+/** `reserved`: freed recently and cooling down for its previous owner (see `reservedUntil`).
+ *  `error`: the registry couldn't be read, so it is unknown — never shown as free (#188). */
+export type HandleAvailability = 'idle' | 'checking' | 'free' | 'taken' | 'reserved' | 'error';
 
 export interface UseCreateProfileOptions {
   from: CreateProfileSource;
-  /** Chosen avatar face, if the caller offers a face picker (only `onboarding.tsx` does). */
+  /** Handle to start with (normalized), e.g. the one a "Claim @x" link on `/u/<x>` carries.
+   *  Read once on mount; its availability check starts right away. */
+  initialHandle?: string;
+  /** Chosen avatar face, if the caller offers a face picker. */
   face?: FaceId;
   /** Called once the profile is stored — created, or restored because the address already
    *  held a handle. `landing-onboard.tsx` uses this to navigate into `/app`; other callers
@@ -33,6 +37,8 @@ export interface UseCreateProfileResult {
   /** `normalizeHandle(handle)` — exposed so callers don't need to import/re-derive it. */
   normalizedHandle: string;
   avail: HandleAvailability;
+  /** Run the availability check again, after it came back `error`. */
+  retryAvailability: () => void;
   /** When a `reserved` handle opens up to everyone, as a localized date; null otherwise. */
   reservedUntil: string | null;
   creating: boolean;
@@ -64,14 +70,20 @@ export interface UseCreateProfileResult {
  * server-rendered marketing page, and a static import here would pull stellar-sdk into
  * that bundle (see the NOTE in `landing-onboard.tsx`).
  */
-export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOptions): UseCreateProfileResult {
+export function useCreateProfile({
+  from,
+  face,
+  onCreated,
+  initialHandle,
+}: UseCreateProfileOptions): UseCreateProfileResult {
   const t = useTranslations();
   const { locale } = useLocale();
   const { wallet, connect, setProfile, restoreProfile } = useWallet();
-  const [handle, setHandle] = useState('');
+  const [handle, setHandle] = useState(() => normalizeHandle(initialHandle ?? ''));
   const [creating, setCreating] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [avail, setAvail] = useState<HandleAvailability>('idle');
+  const [checkAttempt, setCheckAttempt] = useState(0);
   const [reservedUntil, setReservedUntil] = useState<string | null>(null);
   const normalizedHandle = normalizeHandle(handle);
   // A handle its holder just released or renamed away from stays reserved for them for a
@@ -80,6 +92,11 @@ export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOpti
   const day = useCallback(
     (d: Date) => d.toLocaleDateString(locale, { dateStyle: 'medium' }),
     [locale],
+  );
+  // Landing and /app onboarding share one `onboard.*` set; the claim page keeps its own copy.
+  const messageKey = useCallback(
+    (key: string) => (from === 'claim' ? `onboard.claim.${key}` : `onboard.${key}`),
+    [from],
   );
 
   useEffect(() => {
@@ -97,37 +114,36 @@ export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOpti
           setAvail(a.status);
           setReservedUntil(a.status === 'reserved' ? day(a.until) : null);
         })
-        .catch(() => alive && setAvail('idle'));
+        .catch(() => alive && setAvail('error'));
     }, 400);
     return () => {
       alive = false;
       clearTimeout(timer);
     };
-  }, [normalizedHandle, address, day]);
+  }, [normalizedHandle, address, day, checkAttempt]);
+
+  const retryAvailability = useCallback(() => setCheckAttempt((n) => n + 1), []);
 
   /** The address already holds `p`'s handle, now adopted as the local profile. */
   const welcomeBack = useCallback(
     (w: Wallet, p: Profile) => {
       identify(w.address, { handle: p.handle, walletKind: w.kind });
       track('profile_restored', { walletKind: w.kind, from });
-      toast.success(t(`onboard.${from}.restored`, { handle: p.handle }));
+      toast.success(t(messageKey('restored'), { handle: p.handle }));
       onCreated?.(p);
     },
-    [from, onCreated, t],
+    [from, onCreated, t, messageKey],
   );
 
   const createProfile = useCallback(async () => {
     const h = normalizedHandle;
     if (h.length < 3) {
-      toast.error(t(`onboard.${from}.errShort`));
+      toast.error(t(messageKey('errShort')));
       return;
     }
     setCreating(true);
     try {
-      const [{ recordGenesis }, { claimHandle, handleAvailability }] = await Promise.all([
-        import('@/lib/genesis'),
-        import('@/lib/registry'),
-      ]);
+      const { claimHandle, handleAvailability } = await import('@/lib/registry');
       // Reuse an already-connected wallet when there is one, so this never re-triggers
       // connect() / a second FaceID prompt (e.g. right after claimVouch on the claim page).
       const w = wallet ?? (await connect());
@@ -143,15 +159,19 @@ export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOpti
       if (a.status === 'reserved') {
         setAvail('reserved');
         setReservedUntil(day(a.until));
-        toast.error(t(`onboard.${from}.errReserved`, { handle: h, date: day(a.until) }));
+        toast.error(t(messageKey('errReserved'), { handle: h, date: day(a.until) }));
         return;
       }
       if (a.status === 'taken') {
         setAvail('taken');
-        toast.error(t(`onboard.${from}.errTaken`, { handle: h }));
+        toast.error(t(messageKey('errTaken'), { handle: h }));
         return;
       }
-      const tx = w.kind === 'passkey' ? undefined : await recordGenesis(w, h);
+      // Passkey accounts skip the classic-account genesis tx, so they never load its module.
+      const tx =
+        w.kind === 'passkey'
+          ? undefined
+          : await import('@/lib/genesis').then(({ recordGenesis }) => recordGenesis(w, h));
       await claimHandle(w, h);
       const p: Profile = {
         handle: h,
@@ -164,7 +184,7 @@ export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOpti
       setProfile(p);
       identify(w.address, { handle: h, walletKind: w.kind });
       track('profile_created', { walletKind: w.kind, from });
-      toast.success(t(`onboard.${from}.success`, { handle: h }));
+      toast.success(t(messageKey('success'), { handle: h }));
       onCreated?.(p);
     } catch (e) {
       console.error('🛑 createProfile failed →', e);
@@ -173,7 +193,7 @@ export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOpti
     } finally {
       setCreating(false);
     }
-  }, [normalizedHandle, wallet, connect, setProfile, restoreProfile, welcomeBack, face, from, onCreated, t, day]);
+  }, [normalizedHandle, wallet, connect, setProfile, restoreProfile, welcomeBack, face, from, onCreated, t, day, messageKey]);
 
   const restoreAccount = useCallback(async () => {
     setRestoring(true);
@@ -207,6 +227,7 @@ export function useCreateProfile({ from, face, onCreated }: UseCreateProfileOpti
     setHandle,
     normalizedHandle,
     avail,
+    retryAvailability,
     reservedUntil,
     creating,
     createProfile,

@@ -2,6 +2,7 @@
  * alvinmunk service worker — Web Push (VAPID) receiver.
  *
  * Handles:
+ *   install       — activate the new worker immediately (skipWaiting)
  *   push          — show a "your vouch was claimed" notification
  *   notificationclick — focus/open the app when the user taps the notification
  *   pushsubscriptionchange — re-subscribe after an endpoint rotation and move the
@@ -31,6 +32,13 @@ async function readWalletAddress() {
   return pushWalletAddress;
 }
 
+// ─── install ────────────────────────────────────────────────────────────────
+// Without skipWaiting an updated worker stays "waiting" until every tab running the
+// old one is closed; `activate` below then claims the open tabs.
+self.addEventListener('install', () => {
+  self.skipWaiting();
+});
+
 // ─── push ───────────────────────────────────────────────────────────────────
 self.addEventListener('push', (event) => {
   let payload = { title: '🌟 Your vouch was claimed', body: 'Someone lit their star.', vouchId: null };
@@ -43,14 +51,23 @@ self.addEventListener('push', (event) => {
     }
   }
 
+  // A server-supplied target (the tip cron sends /app/inbox, #297) — only a same-origin
+  // path, never another site; otherwise the vouch-claimed default.
+  const url =
+    typeof payload.url === 'string' && payload.url.startsWith('/') && !payload.url.startsWith('//')
+      ? payload.url
+      : payload.vouchId ? `/app` : APP_ORIGIN;
+
   const options = {
     body: payload.body,
     icon: '/assets/brand/alvinmunk-icon-192.png',
     badge: '/assets/brand/alvinmunk-badge-96.png',
-    tag: `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
+    // A server-supplied tag (one per tip, #297) keeps two tips from replacing each other;
+    // vouch-claimed notifications keep their tag shape.
+    tag: typeof payload.tag === 'string' ? payload.tag : `vouch-claimed-${payload.vouchId ?? 'unknown'}`,
     renotify: false,               // same tag → replace, not a second buzz
     data: {
-      url: payload.vouchId ? `/app` : APP_ORIGIN,
+      url,
       vouchId: payload.vouchId,
     },
   };

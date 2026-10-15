@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useCreateProfile } from '@/hooks/use-create-profile';
-import { normalizeHandle } from '@/lib/profile';
+import { HANDLE_MAX_CHARS, normalizeHandle } from '@/lib/profile';
 import { useTranslations } from '@/lib/i18n';
 import { Crest } from '@/components/brand/crest';
 import { AvatarPicker } from '@/components/AvatarPicker';
@@ -10,35 +10,47 @@ import { type FaceId } from '@/lib/avatar';
 import { asset } from '@/lib/assets';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
+import { HandleHint } from '@/components/handle-hint';
 
-export function Onboarding() {
+/** `initialHandle`: prefilled from `/app?handle=<x>` (the "Claim @x" link on `/u/<x>`). */
+export function Onboarding({ initialHandle }: { initialHandle?: string }) {
   const t = useTranslations();
   const [face, setFace] = useState<FaceId | undefined>();
-  const { handle, setHandle, avail, reservedUntil, creating, createProfile, restoring, restoreAccount } =
-    useCreateProfile({
-      from: 'app',
-      face,
-    });
+  const {
+    handle,
+    setHandle,
+    avail,
+    retryAvailability,
+    reservedUntil,
+    creating,
+    createProfile,
+    restoring,
+    restoreAccount,
+  } = useCreateProfile({
+    from: 'app',
+    face,
+    initialHandle,
+  });
 
   return (
     <div className="relative container flex max-w-md flex-col items-center gap-8 py-20">
       <div
         aria-hidden
         className="pointer-events-none absolute inset-0 -z-10 opacity-[0.05] [mask-image:radial-gradient(circle_at_top,black,transparent_70%)]"
-        style={{ backgroundImage: `url(${asset('backgrounds/app-bg.png')})`, backgroundSize: 'cover', backgroundPosition: 'top' }}
+        style={{ backgroundImage: `url(${asset('backgrounds/tile-256.png')})`, backgroundSize: '180px' }}
       />
       <div className="text-center">
-        <p className="eyebrow mb-3">{t('onboard.app.eyebrow')}</p>
-        <h1 className="text-3xl font-semibold">{t('onboard.app.title')}</h1>
+        <p className="eyebrow mb-3">{t('onboard.eyebrow')}</p>
+        <h1 className="text-3xl font-semibold">{t('onboard.title')}</h1>
         <p className="mx-auto mt-2 max-w-xs text-sm text-muted-foreground text-balance">
-          {t('onboard.app.subtitle')}
+          {t('onboard.subtitle')}
         </p>
       </div>
 
       <Crest address={handle ? `profile-${handle}` : 'new-profile'} size={160} points={6} animate />
 
       <div className="flex flex-col items-center gap-2">
-        <p className="text-xs font-medium text-muted-foreground">{t('onboard.app.pickFace')}</p>
+        <p className="text-xs font-medium text-muted-foreground">{t('onboard.pickFace')}</p>
         <AvatarPicker value={face} onChange={setFace} size={48} />
       </div>
 
@@ -53,24 +65,34 @@ export function Onboarding() {
           autoFocus
           value={handle}
           onChange={(e) => setHandle(e.target.value)}
-          placeholder={t('onboard.app.placeholder')}
+          placeholder={t('onboard.placeholder')}
           className="text-center"
-          aria-label={t('onboard.app.ariaLabel')}
-          aria-describedby="handle-status"
+          aria-label={t('onboard.ariaLabel')}
+          aria-describedby="handle-status handle-rules"
+          maxLength={HANDLE_MAX_CHARS}
         />
-        <p id="handle-status" aria-live="polite" className="h-4 text-xs">
-          {avail === 'checking' && <span className="text-muted-foreground">{t('onboard.app.checking')}</span>}
-          {avail === 'free' && <span className="text-secondary">{t('onboard.app.handleFree', { handle: normalizeHandle(handle) })}</span>}
-          {avail === 'taken' && <span className="text-destructive">{t('onboard.app.handleTaken', { handle: normalizeHandle(handle) })}</span>}
-          {avail === 'reserved' && reservedUntil && <span className="text-destructive">{t('onboard.app.handleReserved', { handle: normalizeHandle(handle), date: reservedUntil })}</span>}
+        <HandleHint id="handle-rules" value={handle} className="text-center" />
+        <p id="handle-status" aria-live="polite" className="min-h-4 text-center text-xs">
+          {avail === 'checking' && <span className="text-muted-foreground">{t('onboard.checking')}</span>}
+          {avail === 'free' && <span className="text-secondary">{t('onboard.handleFree', { handle: normalizeHandle(handle) })}</span>}
+          {avail === 'taken' && <span className="text-destructive">{t('onboard.handleTaken', { handle: normalizeHandle(handle) })}</span>}
+          {avail === 'reserved' && reservedUntil && <span className="text-destructive">{t('onboard.handleReserved', { handle: normalizeHandle(handle), date: reservedUntil })}</span>}
+          {avail === 'error' && (
+            <span className="text-destructive">
+              {t('onboard.checkError', { handle: normalizeHandle(handle) })}{' '}
+              <button type="button" onClick={retryAvailability} className="underline underline-offset-2">
+                {t('onboard.retryCheck')}
+              </button>
+            </span>
+          )}
         </p>
         <Button
           type="submit"
           size="lg"
-          disabled={creating || restoring || avail === 'taken' || avail === 'reserved'}
+          disabled={creating || restoring || avail === 'taken' || avail === 'reserved' || avail === 'error'}
           className="w-full"
         >
-          {creating ? t('onboard.app.submitting') : t('onboard.app.submit')}
+          {creating ? t('onboard.creating') : t('onboard.submit')}
         </Button>
       </form>
 
@@ -88,7 +110,7 @@ export function Onboarding() {
       </div>
 
       <p className="text-center text-xs text-muted-foreground text-balance">
-        {t('onboard.app.footer')}
+        {t('onboard.footer')}
       </p>
     </div>
   );
